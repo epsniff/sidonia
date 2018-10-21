@@ -1,0 +1,25 @@
+{
+  "name": "jstag",
+  "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "http://github.com/ariya/coverage-jasmine-istanbul-karma.git"
+  },
+  "devDependencies": {
+    "gulp": "github:gulpjs/gulp#4.0",
+    "gulp-env": "^0.4.0",
+    "gulp-rename": "^1.2.2",
+    "gulp-uglify": "^1.2.0",
+    "gulp-connect": "^2.3.1",
+    "gulp-replace": "^0.5.4",
+    "gulp-open": "^1.0.0",
+    "karma": "^0.13.22",
+    "karma-coverage": "^0.2.7",
+    "phantomjs-prebuilt": "^2.1.4",
+    "karma-chrome-launcher": "^1.0.1",
+    "karma-jasmine": "^1.0.2",
+    "karma-phantomjs-launcher": "^1.0.0",
+    "jasmine-core": "^2.2.0",
+    "jasmine-jquery": "^2.1.1"
+  }
+}

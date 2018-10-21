@@ -1,0 +1,6 @@
+Package s3 signs HTTP requests for use with Amazon’s S3 API.
+
+This package was forked from [@schmichael/s3](https://github.com/schmichael/s3) which was forked from [@kr/s3](https://github.com/kr/s3) years ago for a simple update but didn't get merged back into the main repo.
+
+Documentation:
+http://godoc.org/github.com/lytics/s3

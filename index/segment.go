@@ -16,14 +16,19 @@ type SearchResults struct {
 }
 
 type Segment struct {
-	termDicBytes []byte
-	termDic      *vellum.FST
+	// field ID
+	fieldIdInt     uint32
+	fieldToFieldId map[string]uint32 // external-FieldID --> internal-FieldID
 
-	postings map[uint32]*roaring.Bitmap // termID --> list of doc Ids // TODO replace with roaring bitmaps...
+	// term FieldID to Term Dic
+	termDicBytes    map[uint32][]byte // internal-FieldId --> (bytes) TermDic (FST( Term -- > TermID ))
+	termDicFstCache map[uint32]*vellum.FST
 
 	// termID to postings list DocIds
 	terminIdInt  uint32 // TODO use uint16 instead?  And limit the size of the segment to 65k terms?
 	termToTermID map[string]uint32
+
+	postings map[uint32]*roaring.Bitmap // termID --> list of doc Ids // TODO replace with roaring bitmaps...
 
 	// docid to doc
 	docIdInc                uint32
@@ -31,17 +36,23 @@ type Segment struct {
 	docIDExternalToInternal map[string]uint32
 }
 
-func (seg *Segment) QueryRegEx(ctx context.Context, regEx string) (*SearchResults, error) {
+func (seg *Segment) QueryRegEx(ctx context.Context, field, regEx string) (*SearchResults, error) {
+	var err error
+	fieldId, ok := seg.fieldToFieldId[field]
+	if !ok {
+		return nil, fmt.Errorf("no field-id found for field: %v", field)
+	}
 
-	if seg.termDic == nil {
-		if len(seg.termDicBytes) == 0 {
-			return nil, fmt.Errorf("empty term dictionary")
+	termDictionary, ok := seg.termDicFstCache[fieldId]
+	if !ok {
+		tbytes, ok := seg.termDicBytes[fieldId]
+		if !ok {
+			return nil, fmt.Errorf("no term dictionary found for field: %v", field)
 		}
-		termDic, err := vellum.Load(seg.termDicBytes)
+		termDictionary, err = vellum.Load(tbytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load vellem FST: %v", err)
+			return nil, fmt.Errorf("failed loading term dictionary: err:%v", err)
 		}
-		seg.termDic = termDic
 	}
 	//
 	// Query the Term Dic
@@ -52,7 +63,7 @@ func (seg *Segment) QueryRegEx(ctx context.Context, regEx string) (*SearchResult
 	}
 
 	var res *SearchResults = &SearchResults{}
-	itr, err := seg.termDic.Search(r, nil, nil)
+	itr, err := termDictionary.Search(r, nil, nil)
 	for err == nil {
 		_, termID := itr.Current()
 		// fmt.Printf("found in term Dic: %s - termId:%d\n", term, termID)
@@ -75,9 +86,12 @@ func (seg *Segment) QueryRegEx(ctx context.Context, regEx string) (*SearchResult
 }
 
 func DocsToSegment(ctx context.Context, docs []*Document) (*Segment, error) {
-	index := &Segment{
-		postings:                map[uint32]*roaring.Bitmap{},
+	seg := &Segment{
+		fieldToFieldId: map[string]uint32{},
+		// fieldIdToTermDicBuilder: map[uint32]*vellum.Builder{},
 		termToTermID:            map[string]uint32{},
+		termDicBytes:            map[uint32][]byte{},
+		postings:                map[uint32]*roaring.Bitmap{},
 		docIDInternalToExternal: map[uint32]string{},
 		docIDExternalToInternal: map[string]uint32{},
 	}
@@ -90,39 +104,58 @@ func DocsToSegment(ctx context.Context, docs []*Document) (*Segment, error) {
 		// TODO For performance we'll assume that each docId is unique?  That way we can just increment
 		//  the docIdInc counter on each doc without checking if the doc already exists.
 		docID := uint32(0)
-		if did, ok := index.docIDExternalToInternal[doc.DocID]; ok {
+		if did, ok := seg.docIDExternalToInternal[doc.DocID]; ok {
 			docID = did
 		} else {
-			docID = index.docIdInc
-			index.docIDExternalToInternal[doc.DocID] = docID
-			index.docIDInternalToExternal[docID] = doc.DocID
+			docID = seg.docIdInc
+			seg.docIDExternalToInternal[doc.DocID] = docID
+			seg.docIDInternalToExternal[docID] = doc.DocID
 			// fmt.Println(doc.DocID)
-			index.docIdInc++
+			seg.docIdInc++
 		}
-		for key, val := range doc.Fields {
+		for field, term := range doc.Fields {
+			fieldID := uint32(0)
+			if fid, ok := seg.fieldToFieldId[field]; ok {
+				fieldID = fid
+			} else {
+				fieldID = seg.fieldIdInt
+				seg.fieldToFieldId[field] = fieldID
+				seg.fieldIdInt++
+			}
+
 			termID := uint32(0)
-			term := fmt.Sprintf("%v::%v", key, val)
-			if tid, ok := index.termToTermID[term]; ok {
+			// term := fmt.Sprintf("%v::%v", key, val)
+			if tid, ok := seg.termToTermID[term]; ok {
 				termID = tid
 			} else {
-				termID = index.terminIdInt
-				index.termToTermID[term] = termID
-				index.terminIdInt++
+				termID = seg.terminIdInt
+				seg.termToTermID[term] = termID
+				seg.terminIdInt++
 			}
+
 			// TODO url encode key/vals to avoid collioitions with our split char '::' ?
 			// TODO is this the best way to index strutured data ?
-			fields = append(fields, &IndexableField{InternalDocId: docID, Term: term, TermID: termID})
-			if list, ok := index.postings[termID]; ok {
-				index.postings[termID].Add(docID)
+			if iField, ok := fields[fieldID]; ok {
+				iField.Terms = append(iField.Terms, &Term{Term: term, TermID: termID})
+			} else {
+				iField = &IndexableField{
+					InternalDocId: docID,
+					FieldID:       fieldID,
+					FieldName:     field,
+				}
+				iField.Terms = append(iField.Terms, &Term{Term: term, TermID: termID})
+				fields[fieldID] = iField
+			}
+			// fields = append(fields, &IndexableField{InternalDocId: docID, FieldID: fieldID, Term: term, TermID: termID})
+			if list, ok := seg.postings[termID]; ok {
+				seg.postings[termID].Add(docID)
 			} else {
 				list = roaring.New()
 				list.Add(docID)
-				index.postings[termID] = list
+				seg.postings[termID] = list
 			}
 		}
 	}
-
-	sort.Sort(fields)
 
 	//
 	// Build the Term Dictionary, using an FST (vellum)
@@ -132,25 +165,37 @@ func DocsToSegment(ctx context.Context, docs []*Document) (*Segment, error) {
 	// 	return nil, err
 	// }
 
-	buff := bytes.NewBuffer([]byte{})
-
-	dic, err := vellum.New(buff, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, field := range fields {
-		// fmt.Println(field)
-		err = dic.Insert([]byte(field.Term), uint64(field.TermID))
+	mkFst := func() (*vellum.Builder, *bytes.Buffer, error) {
+		buff := bytes.NewBuffer([]byte{})
+		var vellumOptions *vellum.BuilderOpts
+		dic, err := vellum.New(buff, vellumOptions)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		return dic, buff, nil
 	}
-	if err := dic.Close(); err != nil {
-		return nil, fmt.Errorf("vellum close failed:%v", err)
-	}
-	// index.termDic = dic
-	index.termDicBytes = buff.Bytes()
+	for _, field := range fields {
+		sort.Sort(field.Terms)
 
-	return index, nil
+		// TODO lets stop saving the map of term dics builders on index and
+		// save them onto the IndexableField struct
+
+		fst, buff, err := mkFst()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create FST builder: %v", err)
+		}
+		for _, term := range field.Terms {
+			err := fst.Insert([]byte(term.Term), uint64(term.TermID))
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if err := fst.Close(); err != nil {
+			return nil, fmt.Errorf("vellum close failed:%v", err)
+		}
+		seg.termDicBytes[field.FieldID] = buff.Bytes()
+	}
+
+	return seg, nil
 }

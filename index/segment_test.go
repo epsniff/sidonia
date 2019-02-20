@@ -33,7 +33,11 @@ func TestIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err:%v", err)
 	}
-	res, err := segment.QueryRegEx(context.TODO(), "name::kev.*")
+	res, err := segment.QueryRegEx(context.TODO(), "name", "kev.*")
+	if err != nil {
+		t.Fatalf("err:%v", err)
+	}
+
 	fmt.Printf("found Docs: %v \n", res.DocIds)
 }
 

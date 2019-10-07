@@ -7,13 +7,10 @@ import (
 	"sort"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/araddon/gou"
+	"github.com/araddon/qlbridge/value"
 	"github.com/couchbase/vellum"
-	"github.com/couchbase/vellum/regexp"
 )
-
-type SearchResults struct {
-	DocIds []string
-}
 
 type Segment struct {
 	// field ID
@@ -21,14 +18,11 @@ type Segment struct {
 	fieldToFieldId map[string]uint32 // external-FieldID --> internal-FieldID
 
 	// term FieldID to Term Dic
+	termIdInc       uint32
 	termDicBytes    map[uint32][]byte // internal-FieldId --> (bytes) TermDic (FST( Term -- > TermID ))
 	termDicFstCache map[uint32]*vellum.FST
 
-	// termID to postings list DocIds
-	terminIdInt  uint32 // TODO use uint16 instead?  And limit the size of the segment to 65k terms?
-	termToTermID map[string]uint32
-
-	postings map[uint32]*roaring.Bitmap // termID --> list of doc Ids // TODO replace with roaring bitmaps...
+	postings map[uint32]TermPostingList // termID --> list of doc Ids // TODO replace with roaring bitmaps...
 
 	// docid to doc
 	docIdInc                uint32
@@ -36,65 +30,20 @@ type Segment struct {
 	docIDExternalToInternal map[string]uint32
 }
 
-func (seg *Segment) QueryRegEx(ctx context.Context, field, regEx string) (*SearchResults, error) {
-	var err error
-	fieldId, ok := seg.fieldToFieldId[field]
-	if !ok {
-		return nil, fmt.Errorf("no field-id found for field: %v", field)
-	}
-
-	termDictionary, ok := seg.termDicFstCache[fieldId]
-	if !ok {
-		tbytes, ok := seg.termDicBytes[fieldId]
-		if !ok {
-			return nil, fmt.Errorf("no term dictionary found for field: %v", field)
-		}
-		termDictionary, err = vellum.Load(tbytes)
-		if err != nil {
-			return nil, fmt.Errorf("failed loading term dictionary: err:%v", err)
-		}
-	}
-	//
-	// Query the Term Dic
-	//
-	r, err := regexp.New(regEx)
-	if err != nil {
-		return nil, err
-	}
-
-	var res *SearchResults = &SearchResults{}
-	itr, err := termDictionary.Search(r, nil, nil)
-	for err == nil {
-		_, termID := itr.Current()
-		// fmt.Printf("found in term Dic: %s - termId:%d\n", term, termID)
-		// fmt.Printf("  docs list: %v\n", seg.postings[uint32(termID)])
-		posting := seg.postings[uint32(termID)]
-		postingIter := posting.Iterator()
-		for postingIter.HasNext() {
-			docId := postingIter.Next()
-			eDocId, ok := seg.docIDInternalToExternal[docId]
-			if ok {
-				// fmt.Printf("  found doc: %v \n", eDocId)
-				res.DocIds = append(res.DocIds, eDocId)
-			}
-		}
-		err = itr.Next()
-	}
-	// fmt.Printf("  ----%v\n", seg.terminIdInt)
-
-	return res, nil
-}
-
-func DocsToSegment(ctx context.Context, docs []*Document) (*Segment, error) {
-	seg := &Segment{
+func NewSegment() *Segment {
+	return &Segment{
 		fieldToFieldId: map[string]uint32{},
 		// fieldIdToTermDicBuilder: map[uint32]*vellum.Builder{},
-		termToTermID:            map[string]uint32{},
 		termDicBytes:            map[uint32][]byte{},
-		postings:                map[uint32]*roaring.Bitmap{},
+		postings:                map[uint32]TermPostingList{},
 		docIDInternalToExternal: map[uint32]string{},
 		docIDExternalToInternal: map[string]uint32{},
+
+		termDicFstCache: map[uint32]*vellum.FST{},
 	}
+}
+
+func (seg *Segment) IndexDocuments(ctx context.Context, docs []Document) error {
 
 	// TODO for performance pass in a count of docs * fields so we can presize the array?
 	// TODO is it faster to count the terms first, so the array can be an exact size
@@ -102,63 +51,41 @@ func DocsToSegment(ctx context.Context, docs []*Document) (*Segment, error) {
 
 	for _, doc := range docs {
 		// TODO For performance we'll assume that each docId is unique?  That way we can just increment
-		//  the docIdInc counter on each doc without checking if the doc already exists.
-		docID := uint32(0)
-		if did, ok := seg.docIDExternalToInternal[doc.DocID]; ok {
-			docID = did
+		//      the docIdInc counter on each doc without checking if the doc already exists.
+		inDocID := uint32(0) // internal document id
+		if did, ok := seg.docIDExternalToInternal[doc.ID()]; ok {
+			inDocID = did
 		} else {
-			docID = seg.docIdInc
-			seg.docIDExternalToInternal[doc.DocID] = docID
-			seg.docIDInternalToExternal[docID] = doc.DocID
+			inDocID = seg.docIdInc
+			seg.docIDExternalToInternal[doc.ID()] = inDocID
+			seg.docIDInternalToExternal[inDocID] = doc.ID()
 			// fmt.Println(doc.DocID)
 			seg.docIdInc++
 		}
-		for field, term := range doc.Fields {
-			fieldID := uint32(0)
-			if fid, ok := seg.fieldToFieldId[field]; ok {
-				fieldID = fid
-			} else {
-				fieldID = seg.fieldIdInt
-				seg.fieldToFieldId[field] = fieldID
-				seg.fieldIdInt++
-			}
 
-			termID := uint32(0)
-			// term := fmt.Sprintf("%v::%v", key, val)
-			if tid, ok := seg.termToTermID[term]; ok {
-				termID = tid
-			} else {
-				termID = seg.terminIdInt
-				seg.termToTermID[term] = termID
-				seg.terminIdInt++
+		for field, fieldTerm := range doc.Row() {
+			if fieldTerm.Nil() {
+				// TODO log and continue
+				continue
 			}
-
-			// TODO url encode key/vals to avoid collioitions with our split char '::' ?
-			// TODO is this the best way to index strutured data ?
-			if iField, ok := fields[fieldID]; ok {
-				iField.Terms = append(iField.Terms, &Term{Term: term, TermID: termID})
-			} else {
-				iField = &IndexableField{
-					InternalDocId: docID,
-					FieldID:       fieldID,
-					FieldName:     field,
-				}
-				iField.Terms = append(iField.Terms, &Term{Term: term, TermID: termID})
-				fields[fieldID] = iField
+			if fieldTerm.Err() {
+				// TODO log and continue
+				continue
 			}
-			// fields = append(fields, &IndexableField{InternalDocId: docID, FieldID: fieldID, Term: term, TermID: termID})
-			if list, ok := seg.postings[termID]; ok {
-				seg.postings[termID].Add(docID)
-			} else {
-				list = roaring.New()
-				list.Add(docID)
-				seg.postings[termID] = list
+			// TODO add a mappings setting for the index, and look up the field's mappings
+			//      to ensure that the term type match's the mapping type.
+			switch fieldTerm.Type() {
+			case value.StringType:
+				seg.processStringTerm(fields, inDocID, field, fieldTerm)
+			default:
+				gou.InfoCtx(ctx, "Type %v isn't currently supported.", fieldTerm.Type())
+				continue
 			}
 		}
 	}
 
 	//
-	// Build the Term Dictionary, using an FST (vellum)
+	// Build the Term Dictionary, using an FST (vellum) for string types
 	//
 	// f, err := os.Create("/tmp/term.test.dic")
 	// if err != nil {
@@ -174,6 +101,7 @@ func DocsToSegment(ctx context.Context, docs []*Document) (*Segment, error) {
 		}
 		return dic, buff, nil
 	}
+
 	for _, field := range fields {
 		sort.Sort(field.Terms)
 
@@ -182,20 +110,71 @@ func DocsToSegment(ctx context.Context, docs []*Document) (*Segment, error) {
 
 		fst, buff, err := mkFst()
 		if err != nil {
-			return nil, fmt.Errorf("failed to create FST builder: %v", err)
+			return fmt.Errorf("failed to create FST builder: %v", err)
 		}
 		for _, term := range field.Terms {
 			err := fst.Insert([]byte(term.Term), uint64(term.TermID))
 			if err != nil {
-				return nil, err
+				return err
 			}
 		}
 
 		if err := fst.Close(); err != nil {
-			return nil, fmt.Errorf("vellum close failed:%v", err)
+			return fmt.Errorf("vellum close failed:%v", err)
 		}
 		seg.termDicBytes[field.FieldID] = buff.Bytes()
 	}
 
-	return seg, nil
+	return nil
+}
+
+func (seg *Segment) fieldID(field string) uint32 {
+	if fid, ok := seg.fieldToFieldId[field]; ok {
+		return fid
+	} else {
+		fid = seg.fieldIdInt
+		seg.fieldToFieldId[field] = fid
+		seg.fieldIdInt++
+		return fid
+	}
+}
+
+// processStringTerm processes value.Values of type string, if the wrong type is passed in then we'll get a panic
+func (seg *Segment) processStringTerm(fields IndexableFields, inDocID uint32, field string, rawTerm value.Value) {
+
+	fieldID := seg.fieldID(field)
+
+	term := rawTerm.Value().(string) // this will panic if you use the wrong type
+
+	// TODO is this the best way to index strutured data ?
+	iField, ok := fields[fieldID]
+	if !ok {
+		iField = NewIndexableField(field, fieldID)
+		fields[fieldID] = iField
+	}
+
+	// Term ids are uniq to this instance (aka construction of) a segment.  They are not uniq across segments.
+	termID := uint32(0)
+	if tid, ok := iField.termToTermID[term]; ok {
+		termID = tid
+	} else {
+		// termID = iField.terminIdInt
+		termID = seg.termIdInc
+		iField.termToTermID[term] = termID
+		// iField.terminIdInt++
+		seg.termIdInc++
+	}
+
+	iField.Terms = append(iField.Terms, &Term{Term: term, TermID: termID, InternalDocId: inDocID})
+
+	// fields = append(fields, &IndexableField{InternalDocId: docID, FieldID: fieldID, Term: term, TermID: termID})
+	if list, ok := seg.postings[termID]; ok {
+		postingList := seg.postings[termID]
+		postingList.Postings().Add(inDocID)
+		postingList.TermFrequency++
+	} else {
+		list = TermPostingList{1, roaring.New()}
+		list.Postings().Add(inDocID)
+		seg.postings[termID] = list
+	}
 }

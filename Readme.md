@@ -6,6 +6,8 @@ and algorithm used for full text searching databases like ElasticSearch.
 
 
 # Good reads:
+[Index 1,600,000,000 Keys with Automata and Rust](https://blog.burntsushi.net/transducers/) - learning about FSTs 
+
 https://www.elastic.co/guide/en/elasticsearch/reference/6.2/glossary.html
 
 https://jingxuan.li/2018/08/25/Boolean-retrieval/ 
